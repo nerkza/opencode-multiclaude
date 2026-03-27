@@ -1,0 +1,17 @@
+{
+  "name": "opencode-multiclaude",
+  "version": "0.1.0",
+  "description": "Multi-account Claude/Anthropic switching for OpenCode",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.0.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "typescript": "^5.5.0"
+  }
+}
