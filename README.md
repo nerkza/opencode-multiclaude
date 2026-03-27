@@ -35,9 +35,11 @@ git clone https://github.com/nerkza/opencode-multiclaude.git
 
 ### 1. Import your existing key
 
-Start OpenCode with your `ANTHROPIC_API_KEY` environment variable set as usual, then ask the agent:
+Start OpenCode with your `ANTHROPIC_API_KEY` environment variable set as usual, then run:
 
-> Import my current Anthropic key as "work"
+```
+/user:import-key work
+```
 
 This saves the key from your environment (or `auth.json`) into the multi-account store without it ever appearing in chat history.
 
@@ -45,23 +47,39 @@ This saves the key from your environment (or `auth.json`) into the multi-account
 
 Set a different `ANTHROPIC_API_KEY` and restart OpenCode, then import again:
 
-> Import my current key as "personal"
+```
+/user:import-key personal
+```
 
-Or add a key directly (note: the key will be visible in session history):
+Or ask the agent directly (note: the key will be visible in session history):
 
 > Add a Claude account called "side-project" with key sk-ant-...
 
 ### 3. Switch accounts
 
-> Switch to my personal Claude account
-
-> List my Claude accounts
+```
+/user:switch personal
+/user:accounts
+```
 
 That's it. Switching takes effect on the next API call within the same session.
 
+## Commands
+
+The plugin auto-installs slash commands on first run. Type these directly in the OpenCode TUI:
+
+| Command | Usage | Description |
+|---------|-------|-------------|
+| `/user:switch` | `/user:switch work` | Switch to a named account |
+| `/user:accounts` | `/user:accounts` | List all accounts |
+| `/user:import-key` | `/user:import-key main` | Import the current API key under a name |
+| `/user:remove-account` | `/user:remove-account old` | Remove an account |
+
+Commands are installed to `~/.config/opencode/commands/` and won't overwrite existing files.
+
 ## Tools
 
-The plugin exposes five tools that the AI agent can call:
+The plugin also exposes five tools that the AI agent can call directly (these power the commands above):
 
 | Tool | Description |
 |------|-------------|
@@ -133,7 +151,6 @@ The file is created at `~/.local/share/opencode/multi-account.json` with owner-o
 
 ## Known limitations
 
-- **No GUI for account management** - all interaction is through natural language via the AI agent's tools. A future version could add a `/switch` TUI command.
 - **Auth hook exclusivity** — the plugin registers as the auth handler for `anthropic`. If OpenCode adds a built-in Anthropic auth plugin in the future, they would conflict. This is not currently an issue as no built-in Anthropic auth plugin exists.
 
 ## License

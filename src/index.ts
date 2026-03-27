@@ -5,6 +5,7 @@ import { join } from "path"
 import { homedir } from "os"
 import * as Store from "./store.js"
 import { createOAuthFlow, refreshAccessToken } from "./oauth.js"
+import { installCommands } from "./commands.js"
 
 const AUTH_FILE = join(homedir(), ".local", "share", "opencode", "auth.json")
 
@@ -60,6 +61,8 @@ async function dynamicFetch(url: RequestInfo | URL, init?: RequestInit): Promise
 let pendingOAuthName: string | null = null
 
 export const MultiAccountPlugin: Plugin = async (_input) => {
+  installCommands()
+
   return {
     auth: {
       provider: "anthropic",
