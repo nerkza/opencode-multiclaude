@@ -17,6 +17,8 @@ const COMMANDS: Record<string, string> = {
     'Import the currently active Anthropic API key as an account named "$NAME" using the import_claude_account tool.',
   "remove-account.md":
     'Remove the Claude account named "$ACCOUNT" using the remove_claude_account tool.',
+  "connect-oauth.md":
+    'Use the connect_claude_oauth tool to add a new OAuth account named "$1". Use mode "max" unless the user said "console". Show the full authentication URL to me so I can click it.',
 }
 
 export function installCommands() {

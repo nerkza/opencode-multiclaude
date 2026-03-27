@@ -1,32 +1,27 @@
 /**
- * Hypothetical Anthropic OAuth implementation.
+ * Anthropic OAuth implementation using PKCE.
  *
- * This is a THEORETICAL module — Anthropic does not currently offer a public
- * OAuth program for third-party tools. Their OAuth flow (used by Claude Code
- * and Claude Desktop) is locked to first-party clients and actively rejects
- * tokens from third-party applications.
- *
- * This code models what the integration WOULD look like if Anthropic ever
- * published an OAuth Authorization Server with standard PKCE support,
- * following the same pattern used by OpenCode's Codex plugin for OpenAI.
- *
- * If Anthropic opens up OAuth in the future, replace the placeholder
- * endpoints and client ID below with the real values.
+ * Uses the same OAuth endpoints and client ID as the Claude CLI.
+ * Supports two modes:
+ *   - "max"     → Claude Pro/Max accounts via claude.ai
+ *   - "console" → API Console accounts via platform.claude.com
  */
 
 import { randomBytes, createHash } from "crypto"
 import * as Store from "./store.js"
 
 // ---------------------------------------------------------------------------
-// Placeholder endpoints — replace with real values if Anthropic opens OAuth
+// OAuth endpoints & configuration
 // ---------------------------------------------------------------------------
-const AUTH_BASE = "https://auth.anthropic.com" // does not exist today
-const AUTHORIZE_URL = `${AUTH_BASE}/oauth/authorize`
-const TOKEN_URL = `${AUTH_BASE}/oauth/token`
-const CLIENT_ID = "opencode-multiclaude" // would need to be registered
-const REDIRECT_PORT = 19282
-const REDIRECT_URI = `http://localhost:${REDIRECT_PORT}/callback`
-const SCOPES = "api:read api:write"
+export type OAuthMode = "max" | "console"
+
+const AUTHORIZE_URLS: Record<OAuthMode, string> = {
+  max: "https://claude.ai/oauth/authorize",
+  console: "https://platform.claude.com/oauth/authorize",
+}
+const TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+const SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 
 // ---------------------------------------------------------------------------
 // PKCE helpers
@@ -50,8 +45,12 @@ export async function refreshAccessToken(
 ): Promise<{ accessToken: string; refreshToken: string; expiresAt: number }> {
   const res = await globalThis.fetch(TOKEN_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/plain, */*",
+      "User-Agent": "axios/1.13.6",
+    },
+    body: JSON.stringify({
       grant_type: "refresh_token",
       client_id: CLIENT_ID,
       refresh_token: refreshToken,
@@ -81,14 +80,110 @@ export async function refreshAccessToken(
 // ---------------------------------------------------------------------------
 // OAuth authorize flow (PKCE + local callback server)
 // ---------------------------------------------------------------------------
-export function createOAuthFlow(accountName: string) {
+export function createOAuthFlow(accountName: string, mode: OAuthMode = "max") {
   const { verifier, challenge } = generatePKCE()
   const state = generateState()
 
-  const authorizeUrl = new URL(AUTHORIZE_URL)
+  // Start the callback server first so we know the port
+  let resolveFlow: (
+    value:
+      | { type: "success"; refresh: string; access: string; expires: number }
+      | { type: "failed" }
+  ) => void
+
+  const callbackPromise = new Promise<
+    | { type: "success"; refresh: string; access: string; expires: number }
+    | { type: "failed" }
+  >((resolve) => {
+    resolveFlow = resolve
+  })
+
+  // Use port 0 to let the OS assign a free port
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url)
+      if (url.pathname !== "/callback") {
+        return new Response("Not found", { status: 404 })
+      }
+
+      const code = url.searchParams.get("code")
+      const returnedState = url.searchParams.get("state")
+
+      if (returnedState !== state || !code) {
+        resolveFlow({ type: "failed" })
+        server.stop()
+        return new Response("Authentication failed. You can close this tab.")
+      }
+
+      try {
+        const redirectUri = `http://localhost:${server.port}/callback`
+
+        // Exchange authorization code for tokens
+        const tokenRes = await globalThis.fetch(TOKEN_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "axios/1.13.6",
+          },
+          body: JSON.stringify({
+            grant_type: "authorization_code",
+            client_id: CLIENT_ID,
+            code,
+            state: returnedState,
+            redirect_uri: redirectUri,
+            code_verifier: verifier,
+          }),
+        })
+
+        if (!tokenRes.ok) {
+          resolveFlow({ type: "failed" })
+          server.stop()
+          return new Response("Token exchange failed. You can close this tab.")
+        }
+
+        const data = (await tokenRes.json()) as {
+          access_token: string
+          refresh_token: string
+          expires_in: number
+        }
+
+        const expiresAt = Date.now() + data.expires_in * 1000
+
+        Store.addOAuthAccount(accountName, data.access_token, data.refresh_token, expiresAt)
+
+        resolveFlow({
+          type: "success",
+          refresh: data.refresh_token,
+          access: data.access_token,
+          expires: expiresAt,
+        })
+
+        server.stop()
+        return new Response(
+          "Authenticated successfully! You can close this tab and return to OpenCode.",
+        )
+      } catch {
+        resolveFlow({ type: "failed" })
+        server.stop()
+        return new Response("Authentication error. You can close this tab.")
+      }
+    },
+  })
+
+  // Timeout after 5 minutes
+  setTimeout(() => {
+    resolveFlow({ type: "failed" })
+    server.stop()
+  }, 5 * 60 * 1000)
+
+  const redirectUri = `http://localhost:${server.port}/callback`
+
+  const authorizeUrl = new URL(AUTHORIZE_URLS[mode])
   authorizeUrl.searchParams.set("response_type", "code")
   authorizeUrl.searchParams.set("client_id", CLIENT_ID)
-  authorizeUrl.searchParams.set("redirect_uri", REDIRECT_URI)
+  authorizeUrl.searchParams.set("redirect_uri", redirectUri)
   authorizeUrl.searchParams.set("scope", SCOPES)
   authorizeUrl.searchParams.set("state", state)
   authorizeUrl.searchParams.set("code_challenge", challenge)
@@ -96,91 +191,9 @@ export function createOAuthFlow(accountName: string) {
 
   return {
     url: authorizeUrl.toString(),
-    instructions: `Log in with your Anthropic account to add it as "${accountName}".`,
-
-    /**
-     * Start a local HTTP server to receive the OAuth callback,
-     * exchange the authorization code for tokens, and store them.
-     */
-    async callback(): Promise<
-      | { type: "success"; refresh: string; access: string; expires: number }
-      | { type: "failed" }
-    > {
-      return new Promise((resolve) => {
-        // In a real implementation, this would use Bun.serve() like the
-        // Codex plugin does. Simplified here for clarity.
-        const server = Bun.serve({
-          port: REDIRECT_PORT,
-          async fetch(req) {
-            const url = new URL(req.url)
-            if (url.pathname !== "/callback") {
-              return new Response("Not found", { status: 404 })
-            }
-
-            const code = url.searchParams.get("code")
-            const returnedState = url.searchParams.get("state")
-
-            if (returnedState !== state || !code) {
-              resolve({ type: "failed" })
-              server.stop()
-              return new Response("Authentication failed. You can close this tab.")
-            }
-
-            try {
-              // Exchange authorization code for tokens
-              const tokenRes = await globalThis.fetch(TOKEN_URL, {
-                method: "POST",
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                body: new URLSearchParams({
-                  grant_type: "authorization_code",
-                  client_id: CLIENT_ID,
-                  code,
-                  redirect_uri: REDIRECT_URI,
-                  code_verifier: verifier,
-                }),
-              })
-
-              if (!tokenRes.ok) {
-                resolve({ type: "failed" })
-                server.stop()
-                return new Response("Token exchange failed. You can close this tab.")
-              }
-
-              const data = (await tokenRes.json()) as {
-                access_token: string
-                refresh_token: string
-                expires_in: number
-              }
-
-              const expiresAt = Date.now() + data.expires_in * 1000
-
-              Store.addOAuthAccount(accountName, data.access_token, data.refresh_token, expiresAt)
-
-              resolve({
-                type: "success",
-                refresh: data.refresh_token,
-                access: data.access_token,
-                expires: expiresAt,
-              })
-
-              server.stop()
-              return new Response(
-                "Authenticated successfully! You can close this tab and return to OpenCode.",
-              )
-            } catch {
-              resolve({ type: "failed" })
-              server.stop()
-              return new Response("Authentication error. You can close this tab.")
-            }
-          },
-        })
-
-        // Timeout after 5 minutes
-        setTimeout(() => {
-          resolve({ type: "failed" })
-          server.stop()
-        }, 5 * 60 * 1000)
-      })
+    instructions: `Log in with your ${mode === "max" ? "Claude Pro/Max" : "Anthropic Console"} account to add it as "${accountName}".`,
+    async callback() {
+      return callbackPromise
     },
   }
 }
