@@ -3,14 +3,20 @@ import { tool } from "@opencode-ai/plugin"
 import { readFileSync, appendFileSync } from "fs"
 import { join } from "path"
 import { homedir } from "os"
+import * as Store from "./store.js"
+import { createOAuthFlow, type OAuthMode } from "./oauth.js"
+import { installCommands } from "./commands.js"
+import {
+  shouldAutoSwitch,
+  setCooldown,
+  parseRetryAfter,
+  getNextAvailableAccount,
+} from "./cooldown.js"
 
 const DEBUG_LOG = "/tmp/opencode-multiclaude.log"
 function debug(msg: string) {
   try { appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`) } catch {}
 }
-import * as Store from "./store.js"
-import { createOAuthFlow, type OAuthMode } from "./oauth.js"
-import { installCommands } from "./commands.js"
 
 const AUTH_FILE = join(homedir(), ".local", "share", "opencode", "auth.json")
 
@@ -22,16 +28,19 @@ function readAuthJson(): Record<string, any> {
   }
 }
 
-// Required headers/betas for OAuth requests to the Anthropic API
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 const REQUIRED_BETAS = "oauth-2025-04-20,interleaved-thinking-2025-05-14"
 const OAUTH_USER_AGENT = "claude-cli/2.1.2 (external, cli)"
 const MCP_PREFIX = "mcp_"
 const TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
-/**
- * Prefix tool names in request body with "mcp_" — required for OAuth API calls.
- */
+// ---------------------------------------------------------------------------
+// Request / response helpers
+// ---------------------------------------------------------------------------
+
 function prefixToolNames(body: string): string {
   try {
     const json = JSON.parse(body)
@@ -58,16 +67,10 @@ function prefixToolNames(body: string): string {
   }
 }
 
-/**
- * Strip "mcp_" prefix from tool names in response chunks.
- */
 function stripToolPrefix(text: string): string {
   return text.replace(/"name"\s*:\s*"mcp_/g, '"name":"')
 }
 
-/**
- * Wrap a response to strip mcp_ prefixes from streamed tool names.
- */
 function createStrippedResponse(response: Response): Response {
   if (!response.body) return response
 
@@ -94,22 +97,6 @@ function createStrippedResponse(response: Response): Response {
   })
 }
 
-/**
- * Rewrite URL to add ?beta=true for /v1/messages (required for OAuth).
- */
-function rewriteUrl(input: string | URL | Request): { input: string | URL | Request } {
-  const urlStr = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
-  if (!urlStr.includes("/v1/messages") || urlStr.includes("beta=true")) return { input }
-  const sep = urlStr.includes("?") ? "&" : "?"
-  const newUrl = `${urlStr}${sep}beta=true`
-  if (typeof input === "string") return { input: newUrl }
-  if (input instanceof URL) return { input: new URL(newUrl) }
-  return { input: newUrl }
-}
-
-/**
- * Merge headers from a Request object and init headers into a single Headers.
- */
 function mergeHeaders(input: string | URL | Request, init?: RequestInit): Headers {
   const headers = new Headers()
   if (input instanceof Request) {
@@ -122,16 +109,174 @@ function mergeHeaders(input: string | URL | Request, init?: RequestInit): Header
   return headers
 }
 
-// State for pending OAuth flows
+function rewriteUrl(input: string | URL | Request): { input: string | URL | Request } {
+  const urlStr = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+  if (!urlStr.includes("/v1/messages") || urlStr.includes("beta=true")) return { input }
+  const sep = urlStr.includes("?") ? "&" : "?"
+  const newUrl = `${urlStr}${sep}beta=true`
+  if (typeof input === "string") return { input: newUrl }
+  if (input instanceof URL) return { input: new URL(newUrl) }
+  return { input: newUrl }
+}
+
+// ---------------------------------------------------------------------------
+// Request preparation per account type
+// ---------------------------------------------------------------------------
+
+function prepareOAuthRequest(
+  input: string | URL | Request,
+  init: RequestInit | undefined,
+  originalBody: string | null,
+  accessToken: string,
+): { url: string | URL | Request; options: RequestInit } {
+  const headers = mergeHeaders(input, init)
+  headers.delete("x-api-key")
+  headers.set("Authorization", `Bearer ${accessToken}`)
+  headers.set("anthropic-beta", REQUIRED_BETAS)
+  headers.set("User-Agent", OAUTH_USER_AGENT)
+
+  let body: any = originalBody != null ? prefixToolNames(originalBody) : init?.body
+  const rewritten = rewriteUrl(input)
+
+  return {
+    url: rewritten.input,
+    options: { ...init, body, headers },
+  }
+}
+
+function prepareApiKeyRequest(
+  input: string | URL | Request,
+  init: RequestInit | undefined,
+  originalBody: string | null,
+  apiKey: string,
+): { url: string | URL | Request; options: RequestInit } {
+  const headers = mergeHeaders(input, init)
+  headers.delete("Authorization")
+  headers.set("x-api-key", apiKey)
+
+  const body: any = originalBody ?? init?.body
+
+  return {
+    url: input,
+    options: { ...init, body, headers },
+  }
+}
+
+function wrapResponse(response: Response, accountType: "oauth" | "api"): Response {
+  if (accountType === "oauth") return createStrippedResponse(response)
+  return response
+}
+
+// ---------------------------------------------------------------------------
+// OAuth token refresh
+// ---------------------------------------------------------------------------
+
+async function refreshOAuthToken(
+  auth: { refresh?: string },
+  accountName: string,
+  clientObj: any,
+): Promise<string | null> {
+  if (!auth.refresh) return null
+
+  const maxRetries = 2
+  const baseDelayMs = 500
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** (attempt - 1)))
+      }
+
+      const response = await fetch(TOKEN_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/plain, */*",
+          "User-Agent": "axios/1.13.6",
+        },
+        body: JSON.stringify({
+          grant_type: "refresh_token",
+          refresh_token: auth.refresh,
+          client_id: CLIENT_ID,
+        }),
+      })
+
+      if (!response.ok) {
+        if (response.status >= 500 && attempt < maxRetries) {
+          await response.body?.cancel()
+          continue
+        }
+        debug(`refreshOAuthToken: failed with status ${response.status}`)
+        return null
+      }
+
+      const json = (await response.json()) as {
+        refresh_token: string
+        access_token: string
+        expires_in: number
+      }
+
+      const newExpires = Date.now() + json.expires_in * 1000
+
+      await clientObj.auth.set({
+        path: { id: "anthropic" },
+        body: {
+          type: "oauth",
+          refresh: json.refresh_token,
+          access: json.access_token,
+          expires: newExpires,
+        },
+      })
+
+      Store.updateOAuthTokens(accountName, json.access_token, json.refresh_token, newExpires)
+      debug(`refreshOAuthToken: success for ${accountName}`)
+      return json.access_token
+    } catch (error) {
+      const isNetworkError =
+        error instanceof Error &&
+        (error.message.includes("fetch failed") ||
+          ("code" in error &&
+            ((error as any).code === "ECONNRESET" ||
+              (error as any).code === "ECONNREFUSED" ||
+              (error as any).code === "ETIMEDOUT")))
+
+      if (attempt < maxRetries && isNetworkError) continue
+      debug(`refreshOAuthToken: exception ${error instanceof Error ? error.message : error}`)
+      return null
+    }
+  }
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// Get access token for an account, handling refresh if needed
+// ---------------------------------------------------------------------------
+
+async function getAccessToken(
+  accountName: string,
+  account: Store.OAuthAccount,
+  getAuth: () => Promise<{ type: string; access?: string; refresh?: string; expires?: number }>,
+  clientObj: any,
+): Promise<string | null> {
+  const auth = await getAuth()
+
+  if (auth.access && auth.expires && auth.expires > Date.now()) {
+    return auth.access
+  }
+
+  // Token expired or missing — try refresh
+  return refreshOAuthToken(auth, accountName, clientObj)
+}
+
+// ---------------------------------------------------------------------------
+// Plugin
+// ---------------------------------------------------------------------------
+
 let pendingOAuthName: string | null = null
 
 export const MultiAccountPlugin: Plugin = async ({ client }) => {
   installCommands()
 
-  /**
-   * Update OpenCode's auth store with tokens from our multi-account store.
-   * This syncs our active account into OpenCode's auth system.
-   */
   async function syncAuthToOpenCode(accountName: string) {
     const store = Store.read()
     const account = store.accounts[accountName]
@@ -159,7 +304,6 @@ export const MultiAccountPlugin: Plugin = async ({ client }) => {
   }
 
   return {
-    // The OAuth token is scoped to Claude Code — the API validates this prefix
     'experimental.chat.system.transform': (
       input: { model?: { providerID?: string } },
       output: { system: string[] },
@@ -212,161 +356,118 @@ export const MultiAccountPlugin: Plugin = async ({ client }) => {
       ) {
         debug(`loader called`)
         const auth = await getAuth()
-        debug(`loader: auth.type=${auth.type}, hasAccess=${!!auth.access}, hasRefresh=${!!auth.refresh}, expires=${auth.expires}`)
+        debug(`loader: auth.type=${auth.type}`)
 
-        if (auth.type === "oauth") {
-          // Zero out model costs (included in Pro/Max plan)
-          if (provider?.models) {
-            for (const model of Object.values(provider.models) as any[]) {
-              model.cost = { input: 0, output: 0, cache: { read: 0, write: 0 } }
-            }
+        // Zero out model costs for OAuth (included in Pro/Max plan)
+        if (auth.type === "oauth" && provider?.models) {
+          for (const model of Object.values(provider.models) as any[]) {
+            model.cost = { input: 0, output: 0, cache: { read: 0, write: 0 } }
           }
+        }
 
-          return {
-            apiKey: "",
-            async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+        // Always return a custom fetch so we can auto-switch between any account types
+        return {
+          apiKey: "",
+          async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+            // Capture original body for potential retries
+            const originalBody = (init?.body && typeof init.body === "string") ? init.body : null
+            const inputUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+
+            let store = Store.read()
+            let accountName = store.active
+            let account = accountName ? store.accounts[accountName] : null
+
+            if (!account || !accountName) {
+              debug(`fetch: no active account, falling through`)
+              return fetch(input, init)
+            }
+
+            const triedAccounts = new Set<string>()
+            let lastResponse: Response | null = null
+
+            while (account && accountName && !triedAccounts.has(accountName)) {
+              triedAccounts.add(accountName)
+
               try {
-              const auth = await getAuth()
-              debug(`fetch: auth.type=${auth.type}, url=${typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url}`)
-              if (auth.type !== "oauth") return fetch(input, init)
+                let prepared: { url: string | URL | Request; options: RequestInit }
 
-              // Refresh if expired or missing
-              if (!auth.access || !auth.expires || auth.expires < Date.now()) {
-                debug(`fetch: token expired or missing, refreshing...`)
-                const maxRetries = 2
-                const baseDelayMs = 500
+                if (account.type === "oauth") {
+                  // Get a valid access token (refresh if needed)
+                  const accessToken = await getAccessToken(accountName, account, getAuth, client as any)
+                  if (!accessToken) {
+                    // Refresh failed — treat as unavailable
+                    debug(`fetch: OAuth refresh failed for ${accountName}, trying next account`)
+                    setCooldown(accountName, 401)
 
-                for (let attempt = 0; attempt <= maxRetries; attempt++) {
-                  try {
-                    if (attempt > 0) {
-                      await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** (attempt - 1)))
-                    }
+                    const nextName = getNextAvailableAccount(accountName, store)
+                    if (!nextName) break
 
-                    const response = await fetch(TOKEN_URL, {
-                      method: "POST",
-                      headers: {
-                        "Content-Type": "application/json",
-                        Accept: "application/json, text/plain, */*",
-                        "User-Agent": "axios/1.13.6",
-                      },
-                      body: JSON.stringify({
-                        grant_type: "refresh_token",
-                        refresh_token: auth.refresh,
-                        client_id: CLIENT_ID,
-                      }),
-                    })
+                    Store.switchAccount(nextName)
+                    await syncAuthToOpenCode(nextName)
+                    debug(`auto-switch: ${accountName} -> ${nextName} (refresh failed)`)
 
-                    if (!response.ok) {
-                      if (response.status >= 500 && attempt < maxRetries) {
-                        await response.body?.cancel()
-                        continue
-                      }
-                      throw new Error(`Token refresh failed: ${response.status}`)
-                    }
-
-                    const json = (await response.json()) as {
-                      refresh_token: string
-                      access_token: string
-                      expires_in: number
-                    }
-
-                    const newExpires = Date.now() + json.expires_in * 1000
-
-                    await (client as any).auth.set({
-                      path: { id: "anthropic" },
-                      body: {
-                        type: "oauth",
-                        refresh: json.refresh_token,
-                        access: json.access_token,
-                        expires: newExpires,
-                      },
-                    })
-
-                    // Also update our multi-account store
-                    const store = Store.read()
-                    if (store.active) {
-                      Store.updateOAuthTokens(
-                        store.active,
-                        json.access_token,
-                        json.refresh_token,
-                        newExpires,
-                      )
-                    }
-
-                    auth.access = json.access_token
-                    break
-                  } catch (error) {
-                    const isNetworkError =
-                      error instanceof Error &&
-                      (error.message.includes("fetch failed") ||
-                        ("code" in error &&
-                          ((error as any).code === "ECONNRESET" ||
-                            (error as any).code === "ECONNREFUSED" ||
-                            (error as any).code === "ETIMEDOUT")))
-
-                    if (attempt < maxRetries && isNetworkError) continue
-                    throw error
+                    store = Store.read()
+                    accountName = nextName
+                    account = store.accounts[nextName]
+                    continue
                   }
+
+                  prepared = prepareOAuthRequest(input, init, originalBody, accessToken)
+                } else {
+                  prepared = prepareApiKeyRequest(input, init, originalBody, account.key)
                 }
-              }
 
-              // Transform headers
-              const requestHeaders = mergeHeaders(input, init)
-              requestHeaders.delete("x-api-key")
-              requestHeaders.set("Authorization", `Bearer ${auth.access}`)
-              requestHeaders.set("anthropic-beta", REQUIRED_BETAS)
-              requestHeaders.set("User-Agent", OAUTH_USER_AGENT)
+                debug(`fetch: ${accountName} (${account.type}) -> ${inputUrl}`)
+                const response = await fetch(prepared.url, prepared.options)
+                debug(`fetch: response ${response.status} ${response.statusText}`)
 
-              // Prefix tool names in request body
-              let body = init?.body
-              if (body && typeof body === "string") {
-                body = prefixToolNames(body)
-              }
+                // Check if we should auto-switch
+                if (shouldAutoSwitch(response)) {
+                  const retryAfter = parseRetryAfter(response)
+                  setCooldown(accountName, response.status, retryAfter)
+                  debug(`auto-switch: ${accountName} got ${response.status}, cooldown set`)
 
-              // Rewrite URL
-              const rewritten = rewriteUrl(input)
+                  const nextName = getNextAvailableAccount(accountName, store)
+                  if (!nextName) {
+                    debug(`auto-switch: no available accounts, returning error`)
+                    return wrapResponse(response, account.type)
+                  }
 
-              debug(`fetch: making request to ${typeof rewritten.input === 'string' ? rewritten.input : 'non-string'}`)
-              const hdrs: Record<string, string> = {}
-              requestHeaders.forEach((v, k) => { hdrs[k] = k === 'authorization' ? v.slice(0, 30) + '...' : v })
-              debug(`fetch: headers=${JSON.stringify(hdrs)}`)
-              if (body && typeof body === 'string') {
-                debug(`fetch: body snippet=${body.slice(0, 300)}`)
-              } else {
-                debug(`fetch: body type=${typeof body}, is null/undefined=${body == null}`)
-              }
-              const response = await fetch(rewritten.input, {
-                ...init,
-                body,
-                headers: requestHeaders,
-              })
+                  // Discard the error response
+                  await response.body?.cancel()
 
-              debug(`fetch: response status=${response.status} ${response.statusText}`)
-              if (!response.ok) {
-                const clone = response.clone()
-                try {
-                  const errBody = await clone.text()
-                  debug(`fetch: error body=${errBody.slice(0, 500)}`)
-                } catch {}
-              }
+                  Store.switchAccount(nextName)
+                  await syncAuthToOpenCode(nextName)
+                  debug(`auto-switch: ${accountName} -> ${nextName} (status ${response.status})`)
 
-              // Strip mcp_ prefix from response
-              return createStrippedResponse(response)
+                  store = Store.read()
+                  accountName = nextName
+                  account = store.accounts[nextName]
+                  lastResponse = null
+                  continue
+                }
+
+                if (!response.ok) {
+                  const clone = response.clone()
+                  try {
+                    const errBody = await clone.text()
+                    debug(`fetch: error body=${errBody.slice(0, 500)}`)
+                  } catch {}
+                }
+
+                return wrapResponse(response, account.type)
               } catch (err: any) {
-                debug(`fetch: EXCEPTION ${err?.message ?? err}`)
+                debug(`fetch: EXCEPTION for ${accountName}: ${err?.message ?? err}`)
                 throw err
               }
-            },
-          }
-        }
+            }
 
-        // For API key auth, check our store for multi-account support
-        const store = Store.read()
-        if (store.active && store.accounts[store.active]?.type === "api") {
-          return { apiKey: (store.accounts[store.active] as Store.ApiAccount).key }
+            // All accounts tried — return the last error or fall through
+            if (lastResponse) return lastResponse
+            debug(`fetch: all accounts exhausted`)
+            return fetch(input, init)
+          },
         }
-
-        return {}
       },
     },
 
@@ -384,7 +485,6 @@ export const MultiAccountPlugin: Plugin = async ({ client }) => {
             const names = accounts.map((a) => a.name).join(", ")
             return `Account "${args.name}" not found. Available accounts: ${names || "none"}`
           }
-          // Sync the new active account into OpenCode's auth
           await syncAuthToOpenCode(args.name)
           const account = result.accounts[args.name]
           const authType = account.type === "oauth" ? " (OAuth)" : " (API key)"
@@ -488,8 +588,6 @@ export const MultiAccountPlugin: Plugin = async ({ client }) => {
           const mode = (args.mode ?? "max") as OAuthMode
           const flow = createOAuthFlow(args.name, mode)
 
-          // Fire-and-forget: when the user completes auth in the browser,
-          // the callback server stores the tokens and syncs to OpenCode
           flow.callback().then(async (result) => {
             if (result.type === "success") {
               await syncAuthToOpenCode(args.name)

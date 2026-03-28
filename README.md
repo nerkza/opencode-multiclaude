@@ -156,12 +156,32 @@ For OAuth accounts, the plugin's custom `fetch()` handler:
 - Appends `?beta=true` to `/v1/messages` requests
 - Handles automatic token refresh with retry logic
 
+## Auto-switch on failure
+
+When an API request fails with an account-specific error, the plugin automatically switches to the next available account and retries the request. This happens transparently — no user intervention required.
+
+**Triggers:**
+
+| Status | Behavior |
+|--------|----------|
+| 429 (rate limited) | Switch if `Retry-After` exceeds 30 seconds |
+| 402 (out of credits) | Switch immediately |
+| 403 (forbidden) | Switch immediately |
+| OAuth refresh failure | Switch immediately |
+
+Failed accounts are placed on a cooldown (60s for rate limits, 5 minutes for credit/auth issues) and skipped until the cooldown expires. If all accounts are on cooldown, the original error is returned.
+
+Auto-switch works across account types — the plugin can fail over from an OAuth account to an API key account (or vice versa), automatically adjusting the request format.
+
+Switch events are logged to `/tmp/opencode-multiclaude.log`. Run `/accounts` to see which account is currently active.
+
 ## How it works
 
 - Accounts are stored in `~/.local/share/opencode/multi-account.json` with `0600` file permissions.
-- The plugin registers an auth hook for the `anthropic` provider with a custom `fetch()` function that reads the active account on every API request — this enables mid-session switching without restarting.
+- The plugin registers an auth hook for the `anthropic` provider with a unified custom `fetch()` function that handles both OAuth and API key accounts — reading the active account on every request for mid-session switching without restarting.
 - For **API key accounts**, the fetch sets the `x-api-key` header.
 - For **OAuth accounts**, the fetch handles the full request/response transformation pipeline required by the Anthropic OAuth API.
+- On failure (429/402/403), the fetch retries with the next available account, adjusting the request pipeline for the target account type.
 - OAuth tokens are synced to OpenCode's built-in auth store via `client.auth.set()`, ensuring compatibility with OpenCode's auth lifecycle.
 - When no accounts are configured, the plugin is transparent and default Anthropic auth works as normal.
 
